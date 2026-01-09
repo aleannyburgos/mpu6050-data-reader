@@ -1,73 +1,89 @@
-# MPU6050 Data Reader
+# MPU6050 Data Reader (STM32 HAL + CMSIS-RTOS2)
 
-A lightweight STM32 HAL-based driver for the **MPU6050** 6-axis accelerometer and gyroscope.
+An STM32 HAL–based **MPU6050** driver and RTOS application that acquires raw IMU data
+(accelerometer, gyroscope, temperature) over **I²C**, streams it over **UART**, and performs
+all unit conversion and analysis **off-target in MATLAB**.
 
-This project demonstrates how to initialize the sensor over I²C, read accelerometer, gyroscope, and temperature data, and send the values over UART to a serial terminal.
+This project focuses on:
+- Correct MPU6050 bring-up and configuration
+- Robust I²C communication using STM32 HAL
+- RTOS-based task separation (init, acquisition, transport)
+- Clean data handoff for external processing
 
 ---
 
 ## Hardware
-- **STM32 Nucleo-L476RG** development board  
-- **MPU6050 IMU Sensor** (I²C interface)  
-- **USB connection** for power and serial communication  
+- **STM32 Nucleo-L476RG**
+- **MPU6050 IMU Sensor** (I²C)
+- USB (power + UART via ST-LINK VCP)
 
 ### Pin Connections
 | MPU6050 | STM32 Nucleo-L476RG |
-|----------|---------------------|
-| VCC      | 3.3V               |
-| GND      | GND                |
-| SCL      | PB8 (I2C1_SCL)     |
-| SDA      | PB9 (I2C1_SDA)     |
-| AD0      | GND *(I2C address = 0x68)* |
+|-------:|----------------------|
+| VCC    | 3.3V                 |
+| GND    | GND                  |
+| SCL    | PB8 (I2C1_SCL)       |
+| SDA    | PB9 (I2C1_SDA)       |
+| AD0    | GND *(I²C address = 0x68)* |
 
 ---
 
 ## Software
-- **STM32CubeIDE**  
-- **STM32 HAL drivers** enabled (`I2C1`, `USART2`)  
-- Build configuration: *Debug / Release*  
-- UART baud rate: **115200, 8N1**
+- **STM32CubeIDE**
+- **STM32 HAL** (I2C1, USART2)
+- **CMSIS-RTOS2** (FreeRTOS)
+- UART: **115200 baud, 8-N-1**
 
-### Building
-1. Clone this repository.  
-2. Open the `.ioc` file in STM32CubeIDE.  
-3. Generate code and build the project.  
-4. Flash it to the Nucleo board.
+---
 
-### Serial Monitor
-Use any terminal at 115200 baud:
-bash
-screen /dev/ttyACM0 115200
+## RTOS Architecture
 
-## Functions
-MPU6050_Init()
-- Initializes the MPU6050 module.
-- Verifies device ID (WHO_AM_I register = 0x68).
-- Wakes the device from sleep mode.
+The application is structured as three RTOS tasks:
+
+### 1) `MPUinit_task` (High Priority)
+- Calls `MPU6050_init()`
+- Verifies device ID (`WHO_AM_I == 0x68`)
+- Configures sensor registers
+- On success: releases a semaphore and exits
+- On failure: reports error code over UART and retries
+
+### 2) `GetData_task` (Low Priority)
+- Waits on initialization semaphore
+- Reads raw IMU data using `MPU6050_GetData()`
+- Pushes samples into a message queue
+- Runs at ~100 Hz (`osDelay(10)`)
+
+### 3) `UART_task` (Normal Priority)
+- Blocks on the message queue
+- Transmits raw sensor values over UART as ASCII text
+
+This separation prevents blocking I²C reads on UART transmission
+and cleanly decouples acquisition from transport.
+
+---
+
+## Driver API
+
+### `HAL_StatusTypeDef MPU6050_init(I2C_HandleTypeDef *hi2c, MPU_ERROR *error)`
+Initializes the MPU6050:
+- Reads `WHO_AM_I`
+- Resets the device
+- Selects internal clock
 - Configures:
-    Gyroscope → ±250°/s, Accelerometer → ±2g, Sample rate → 8 kHz
-  
-MPU6050_Read_Accel()
-- Reads data from the six accelerometer registers and converts them into the corresponding X, Y, Z acceleration values (g).
-- Updates global variables:
-    Accel_X_RAW, Accel_Y_RAW, Accel_Z_RAW, and Ax, Ay, Az.
+  - DLPF (`CONFIG = 0x03`)
+  - Sample rate divider (`SMPLRT_DIV = 0x09`)
+  - Gyro range: ±250 °/s
+  - Accel range: ±2 g
 
-MPU6050_Read_Gyro()
-- Reads data from the six gyroscope registers and converts them into the corresponding X, Y, Z angular velocity values (°/s).
-- Updates:
-    Gyro_X_RAW, Gyro_Y_RAW, Gyro_Z_RAW, and Gx, Gy, Gz.
+If initialization fails, a detailed reason is returned via `MPU_ERROR`.
 
-MPU6050_Read_Temp()
-- Reads data from the two temperature registers and converts it to °C.
-- Updates the global variable temp.
+---
 
-## Documentation & References 
-- **MPU6050 Datasheet** — [InvenSense MPU-6000/6050 Register Map and Descriptions](https://invensense.tdk.com/download-pdf/mpu-6000-register-map/)
-- **STM32 HAL API Reference** — [STMicroelectronics HAL Library Documentation](https://www.st.com/en/embedded-software/stm32cube-mcu-packages.html)
-- **NUCLEO-L476RG Board User Manual** — [UM1724 on st.com](https://www.st.com/resource/en/user_manual/dm00105823.pdf)
-- **I²C and UART Configuration** — STM32CubeIDE auto-generated code examples
-  
-**Formula Reference:**
-- *Accelerometer scaling:* 1 g = 16384 LSB (for ±2g)
-- *Gyroscope scaling:* 1 °/s = 131 LSB (for ±250°/s)
-- *Temperature:* Temp(°C) = (Raw / 340) + 36.53
+### `HAL_StatusTypeDef MPU6050_GetData(I2C_HandleTypeDef *hi2c,
+                                      mpu6050_data_t *data,
+                                      MPU_ERROR *error)`
+- Performs a **single 14-byte burst read** starting at `ACCEL_XOUT_H`
+- Populates the following **raw** values:
+
+```text
+ax ay az temp gx gy gz
